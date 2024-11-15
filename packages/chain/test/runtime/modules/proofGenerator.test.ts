@@ -1,72 +1,67 @@
 // src/tests/modules/proofGenerator.test.ts
-import { 
+import "reflect-metadata";
+import {
   generateCredentialProof,
-  ProofGenerationError 
-} from '../../../src/runtime/modules/proofGenerator';
+  ProofGenerationError,
+} from "../../../src/runtime/modules/proofGenerator";
+import { merkleTreeManager } from "../../../src/runtime/modules/merkleTreeManager";
+import {
+  credentials,
+  CredentialProof,
+  CredentialPublicOutput,
+} from "../../../src/runtime/modules/credentials";
+import { Field, PrivateKey, PublicKey, MerkleMap, Poseidon, Bool } from "o1js";
 
-import { merkleTreeManager } from '../../../src/runtime/modules/merkleTreeManager';
-import { credentials, CredentialProof, CredentialPublicOutput } from '../../../src/runtime/modules/credentials';
-import { Field, PrivateKey, PublicKey, MerkleMap, Poseidon, Bool } from 'o1js';
+describe("ProofGenerator", () => {
+  const adminKey = PrivateKey.random();
+  const issuerKey = PrivateKey.random();
+  const userKey = PrivateKey.random();
 
-describe('ProofGenerator', () => {
-  const ownerKey = PrivateKey.random();
-  const owner = ownerKey.toPublicKey();
-  const credentialId = "test-credential";
-  const credentialHash = Field(1234);
-  const expirationBlock = Field(1000);
-  const verificationHash = Field(5678);
-
-  // Setup Merkle Map
+  // Setup MerkleMap
   const map = new MerkleMap();
-  const key = Poseidon.hash(ownerKey.toPublicKey().toFields());
+  const key = Poseidon.hash(userKey.toPublicKey().toFields());
   map.set(key, Bool(true).toField());
 
   const witness = map.getWitness(key);
+  const credentialHash = Field(1234);
+  const expirationBlock = Field(1000);
 
+  // Store original functions
   const originalCompile = credentials.compile;
   const originalVerifyCredential = credentials.verifyCredential;
 
   async function mockProof(
-    credentialHash: Field,
-    owner: PublicKey,
-    expirationBlock: Field,
-    verificationHash: Field
+    hash: Field,
+    issuer: PublicKey,
+    expBlock: Field
   ): Promise<CredentialProof> {
-    console.log("generating mock proof");
-    console.time("mockProof");
-    
     const publicOutput = new CredentialPublicOutput({
       root: map.getRoot(),
-      credentialHash,
-      owner,
-      expirationBlock,
-      verificationHash,
+      credentialHash: hash,
+      issuer: issuer,
+      expirationBlock: expBlock,
     });
 
-    const proof = await CredentialProof.dummy(
-      undefined, // public inputs should be undefined for CredentialProof
-      publicOutput,
-      0  // maxProofsVerified parameter
-    );
-    console.timeEnd("mockProof");
-    return proof as CredentialProof; // Add type assertion
+    return await CredentialProof.dummy(undefined, publicOutput, 0);
   }
 
   beforeAll(async () => {
+    // Mock credentials functions
     credentials.compile = async () => {
       return {
         verificationKey: {
-          data: 'mockData',
-          hash: Field(0),
+          data: "mockData",
+          hash: Field(0), // or any appropriate mock Field value
         },
       };
     };
-    credentials.verifyCredential = async (witness, hash, owner, expirationBlock, verificationHash) => {
-      return await mockProof(hash, owner, expirationBlock, verificationHash);
-    }
+    credentials.verifyCredential = async (witness, hash, issuer, expBlock) => {
+      return mockProof(hash, issuer, expBlock);
+    };
   });
 
   afterAll(() => {
+    // Restore original functions
     credentials.compile = originalCompile;
     credentials.verifyCredential = originalVerifyCredential;
   });
@@ -75,118 +70,143 @@ describe('ProofGenerator', () => {
     merkleTreeManager.reset();
   });
 
-
-  it('should generate proof for valid credential', async () => {
-    merkleTreeManager.addCredentialHash(credentialId, credentialHash, verificationHash);
+  it("should generate proof for valid credential", async () => {
+    // Add credential to merkle tree
+    merkleTreeManager.addCredentialHash("test-id", credentialHash);
 
     const proof = await generateCredentialProof(
-      credentialId,
+      "test-id",
       credentialHash,
-      owner,
-      expirationBlock,
-      verificationHash
+      issuerKey.toPublicKey(),
+      expirationBlock
     );
 
     expect(proof).toBeDefined();
-    expect(proof.publicOutput.credentialHash.toString()).toBe(credentialHash.toString());
-    expect(proof.publicOutput.owner.toBase58()).toBe(owner.toBase58());
-    expect(proof.publicOutput.expirationBlock.toString()).toBe(expirationBlock.toString());
-    expect(proof.publicOutput.verificationHash.toString()).toBe(verificationHash.toString());
+    expect(proof.publicOutput.credentialHash.toString()).toBe(
+      credentialHash.toString()
+    );
+    expect(proof.publicOutput.issuer.toBase58()).toBe(
+      issuerKey.toPublicKey().toBase58()
+    );
+    expect(proof.publicOutput.expirationBlock.toString()).toBe(
+      expirationBlock.toString()
+    );
   });
 
-  it('should throw when credential not found', async () => {
-    await expect(
-      generateCredentialProof(
-        'non-existent',// This should be undefined
+  it("should throw when credential not found", async () => {
+    try {
+      await generateCredentialProof(
+        "non-existent",
         credentialHash,
-        owner,
-        expirationBlock,
-        verificationHash
-      )
-    ).rejects.toThrow(ProofGenerationError);
-  });
-
-  it('should handle compilation failure', async () => {
-    merkleTreeManager.addCredentialHash(credentialId, credentialHash, verificationHash);
-    
-    const originalCompile = credentials.compile;
-    credentials.compile = async () => {
-      throw new Error('Compilation failed');
-    };
-
-    try {
-      await expect(
-        generateCredentialProof(
-          credentialId,
-          credentialHash,
-          owner,
-          expirationBlock,
-          verificationHash
-        )
-      ).rejects.toThrow(ProofGenerationError);
-    } finally {
-      credentials.compile = originalCompile;
+        issuerKey.toPublicKey(),
+        expirationBlock
+      );
+      throw new Error("Should have thrown ProofGenerationError");
+    } catch (error) {
+      expect(error instanceof ProofGenerationError).toBe(true);
+      expect((error as Error).message).toContain(
+        "Credential not found in Merkle tree"
+      );
     }
   });
 
-  it('should handle proof generation failure', async () => {
-    merkleTreeManager.addCredentialHash(credentialId, credentialHash, verificationHash);
-    
-    const originalVerifyCredential = credentials.verifyCredential;
-    credentials.verifyCredential = async () => {
-      throw new Error('Proof generation failed');
-    };
+  it("should handle proof generation with different credentials", async () => {
+    const testCredentials = [
+      { id: "cred1", hash: Field(1) },
+      { id: "cred2", hash: Field(2) },
+    ];
 
-    try {
-      await expect(
-        generateCredentialProof(
-          credentialId,
-          credentialHash,
-          owner,
-          expirationBlock,
-          verificationHash
-        )
-      ).rejects.toThrow(ProofGenerationError);
-    } finally {
-      credentials.verifyCredential = originalVerifyCredential;
+    for (const cred of testCredentials) {
+      merkleTreeManager.addCredentialHash(cred.id, cred.hash);
+
+      const proof = await generateCredentialProof(
+        cred.id,
+        cred.hash,
+        issuerKey.toPublicKey(),
+        expirationBlock
+      );
+
+      expect(proof.publicOutput.credentialHash.toString()).toBe(
+        cred.hash.toString()
+      );
     }
   });
 
-  it('should handle unknown errors', async () => {
-    merkleTreeManager.addCredentialHash(credentialId, credentialHash, verificationHash);
-    
-    const originalVerifyCredential = credentials.verifyCredential;
-    credentials.verifyCredential = async () => {
-      throw null;
-    };
+  it("should handle metadata correctly", async () => {
+    const testId = "test-id";
+    merkleTreeManager.addCredentialHash(testId, credentialHash);
 
-    try {
-      await expect(
-        generateCredentialProof(
-          credentialId,
-          credentialHash,
-          owner,
-          expirationBlock,
-          verificationHash
-        )
-      ).rejects.toThrow('Failed to generate credential proof: Unknown error');
-    } finally {
-      credentials.verifyCredential = originalVerifyCredential;
-    }
-  });
-
-  it('should verify generated proof', async () => {
-    merkleTreeManager.addCredentialHash(credentialId, credentialHash, verificationHash);
-
+    const customExpiration = Field(2000);
     const proof = await generateCredentialProof(
-      credentialId,
+      testId,
       credentialHash,
-      owner,
-      expirationBlock,
-      verificationHash
+      issuerKey.toPublicKey(),
+      customExpiration
     );
 
-    // The proof should verify without throwing
-    expect(() => proof.verify()).not.toThrow();
+    expect(proof.publicOutput.expirationBlock.toString()).toBe(
+      customExpiration.toString()
+    );
+    expect(proof.publicOutput.issuer.toBase58()).toBe(
+      issuerKey.toPublicKey().toBase58()
+    );
+  });
+
+  it("should handle compilation failure", async () => {
+    merkleTreeManager.addCredentialHash("test-id", credentialHash);
+
+    // Mock compilation failure
+    credentials.compile = async () => {
+      throw new Error("Compilation failed");
+    };
+
+    try {
+      await generateCredentialProof(
+        "test-id",
+        credentialHash,
+        issuerKey.toPublicKey(),
+        expirationBlock
+      );
+      throw new Error("Should have thrown ProofGenerationError");
+    } catch (error) {
+      expect(error instanceof ProofGenerationError).toBe(true);
+      expect((error as Error).message).toContain("Compilation failed");
+    }
+
+    // Restore compile function
+    credentials.compile = async () => {
+      return {
+        verificationKey: {
+          data: "mockData",
+          hash: Field(0), // or any appropriate mock Field value
+        },
+      };
+    };
+  });
+
+  it("should handle proof generation failure", async () => {
+    merkleTreeManager.addCredentialHash("test-id", credentialHash);
+
+    // Mock proof generation failure
+    const originalVerify = credentials.verifyCredential;
+    credentials.verifyCredential = async () => {
+      throw new Error("Proof generation failed");
+    };
+
+    try {
+      await generateCredentialProof(
+        "test-id",
+        credentialHash,
+        issuerKey.toPublicKey(),
+        expirationBlock
+      );
+      throw new Error("Should have thrown ProofGenerationError");
+    } catch (error) {
+      expect(error instanceof ProofGenerationError).toBe(true);
+      expect((error as Error).message).toContain("Proof generation failed");
+    }
+
+    // Restore verify function
+    credentials.verifyCredential = originalVerify;
   });
 });

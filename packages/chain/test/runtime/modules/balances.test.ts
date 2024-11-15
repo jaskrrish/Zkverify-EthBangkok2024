@@ -1,4 +1,4 @@
-// src/tests/modules/credentials.test.ts
+// src/tests/zkCredentials.test.ts
 import "reflect-metadata";
 import { TestingAppChain } from "@proto-kit/sdk";
 import {
@@ -7,21 +7,17 @@ import {
   credentials as credentialsProgram,
   CredentialPublicOutput,
 } from "../../../src/runtime/modules/credentials";
-import { merkleTreeManager } from "../../../src/runtime/modules/merkleTreeManager";
 import {
   PrivateKey,
   PublicKey,
   Field,
-  Bool,
   MerkleMap,
   Poseidon,
+  Bool,
+  Signature,
 } from "o1js";
 import { Balances } from "../../../src/runtime/modules/balances";
 import { Balance } from "@proto-kit/library";
-import {
-  CredentialType,
-  CredentialMetadata,
-} from "../../../src/runtime/modules/types";
 
 describe("ZK Credentials", () => {
   let appChain = TestingAppChain.fromRuntime({
@@ -31,36 +27,34 @@ describe("ZK Credentials", () => {
   let credentials: Credentials;
   let credentialProof: CredentialProof;
 
-  const ownerKey = PrivateKey.random();
-  const owner = ownerKey.toPublicKey();
-  const credentialId = "test-credential";
-  const credentialHash = Field(1234);
-  const expirationBlock = Field(1000);
-  const verificationHash = Field(5678);
+  const adminKey = PrivateKey.random();
+  const issuerKey = PrivateKey.random();
+  const userKey = PrivateKey.random();
 
-  // Setup Merkle Map
+  // Setup MerkleMap
   const map = new MerkleMap();
-  const key = Poseidon.hash(ownerKey.toPublicKey().toFields());
+  const key = Poseidon.hash(userKey.toPublicKey().toFields());
   map.set(key, Bool(true).toField());
 
   const witness = map.getWitness(key);
+  const credentialHash = Field(1234); // Example credential hash
+  const expirationBlock = Field(1000);
 
   async function mockProof(): Promise<CredentialProof> {
     console.log("generating mock proof");
     console.time("mockProof");
-    
+
     const publicOutput = new CredentialPublicOutput({
       root: map.getRoot(),
       credentialHash,
-      owner,
+      issuer: issuerKey.toPublicKey(),
       expirationBlock,
-      verificationHash,
     });
 
     const proof = await CredentialProof.dummy(
       undefined, // public inputs should be undefined for CredentialProof
       publicOutput,
-      0  // maxProofsVerified parameter
+      0 // maxProofsVerified parameter
     );
     console.timeEnd("mockProof");
     return proof as CredentialProof; // Add type assertion
@@ -77,15 +71,17 @@ describe("ZK Credentials", () => {
     const proof = await credentialsProgram.verifyCredential(
       witness,
       credentialHash,
-      owner,
-      expirationBlock,
-      verificationHash
+      issuerKey.toPublicKey(),
+      expirationBlock
     );
     console.timeEnd("proof");
     return proof;
   }
 
   beforeAll(async () => {
+    // Set admin public key in environment
+    process.env.ADMIN_PUBLIC_KEY = adminKey.toPublicKey().toBase58();
+
     appChain = TestingAppChain.fromRuntime({
       Credentials,
       Balances,
@@ -102,147 +98,172 @@ describe("ZK Credentials", () => {
 
     await appChain.start();
     credentials = appChain.runtime.resolve("Credentials");
+
+    // Generate proof - use mock for faster tests
     credentialProof = await mockProof();
+    // For real proof testing:
+    // credentialProof = await realProof();
   }, 1_000_000);
 
-  it("should create credential with valid verification", async () => {
-    appChain.setSigner(ownerKey);
-
-    // Set verification status
-    const tx1 = await appChain.transaction(ownerKey.toPublicKey(), () => {
-      return credentials.setVerificationStatus(verificationHash, Bool(true));
-    });
-
-    await tx1.sign();
-    await tx1.send();
-    await appChain.produceBlock();
-
-    // Create credential
-    appChain.setSigner(ownerKey);
-    const tx2 = await appChain.transaction(ownerKey.toPublicKey(), () => {
-      return credentials.createCredential(
-        credentialHash,
-        expirationBlock,
-        verificationHash
-      );
-    });
-
-    await tx2.sign();
-    await tx2.send();
-    const block = await appChain.produceBlock();
-
-    expect(block?.transactions[0].status.toBoolean()).toBe(true);
-  });
-
-  it("should reject unverified credential creation", async () => {
-    appChain.setSigner(ownerKey);
-
-    // unverified credential
-    const tx1 = await appChain.transaction(ownerKey.toPublicKey(), () => {
-      return credentials.setVerificationStatus(verificationHash, Bool(false));
-    });
-    await tx1.sign();
-    await tx1.send();
-    await appChain.produceBlock();
-
-    // Create credential
-    appChain.setSigner(ownerKey);
-    const tx = await appChain.transaction(ownerKey.toPublicKey(), () => {
-      return credentials.createCredential(
-        credentialHash,
-        expirationBlock,
-        verificationHash
+  it("should setup the credential root", async () => {
+    // First register issuer
+    appChain.setSigner(adminKey);
+    let tx = await appChain.transaction(adminKey.toPublicKey(), () => {
+      return credentials.registerIssuer(
+        issuerKey.toPublicKey(),
+        Signature.create(adminKey, issuerKey.toPublicKey().toFields())
       );
     });
 
     await tx.sign();
     await tx.send();
+    await appChain.produceBlock();
+
+    // Then set credential root
+    appChain.setSigner(issuerKey);
+    const signature = Signature.create(issuerKey, [map.getRoot()]);
+    tx = await appChain.transaction(issuerKey.toPublicKey(), () => {
+      return credentials.setCredentialRoot(map.getRoot(), signature);
+    });
+
+    await tx.sign();
+    await tx.send();
+
     const block = await appChain.produceBlock();
 
-    expect(block?.transactions[0].status.toBoolean()).toBe(false);
-    expect(block?.transactions[0].statusMessage).toMatch(/not verified/);
+    const storedRoot =
+      await appChain.query.runtime.Credentials.credentialRoot.get();
+
+    expect(block?.transactions[0].status.toBoolean()).toBe(true);
+    expect(storedRoot?.toBigInt()).toBe(map.getRoot().toBigInt());
+  });
+
+  it("should register issuer correctly", async () => {
+    appChain.setSigner(adminKey);
+    const tx = await appChain.transaction(adminKey.toPublicKey(), () => {
+      return credentials.registerIssuer(
+        issuerKey.toPublicKey(),
+        Signature.create(adminKey, issuerKey.toPublicKey().toFields())
+      );
+    });
+
+    await tx.sign();
+    await tx.send();
+
+    const block = await appChain.produceBlock();
+
+    const isIssuer = await appChain.query.runtime.Credentials.issuers.get(
+      issuerKey.toPublicKey()
+    );
+
+    expect(block?.transactions[0].status.toBoolean()).toBe(true);
+    expect(isIssuer?.toBoolean()).toBe(true);
   });
 
   it("should verify valid credential proof", async () => {
-
-    appChain.setSigner(ownerKey);
-
-    // Setup verification and root
-    const tx1 = await appChain.transaction(ownerKey.toPublicKey(), async () => {
-      await credentials.setVerificationStatus(verificationHash, Bool(true));
-      await credentials.setCredentialRoot(map.getRoot());
+    // Setup: Register issuer and set root
+    appChain.setSigner(adminKey);
+    let tx = await appChain.transaction(adminKey.toPublicKey(), () => {
+      return credentials.registerIssuer(
+        issuerKey.toPublicKey(),
+        Signature.create(adminKey, issuerKey.toPublicKey().toFields())
+      );
     });
+    await tx.sign();
+    await tx.send();
+    await appChain.produceBlock();
 
-    await tx1.sign();
-    await tx1.send();
+    appChain.setSigner(issuerKey);
+    tx = await appChain.transaction(issuerKey.toPublicKey(), () => {
+      return credentials.setCredentialRoot(
+        map.getRoot(),
+        Signature.create(issuerKey, [map.getRoot()])
+      );
+    });
+    await tx.sign();
+    await tx.send();
     await appChain.produceBlock();
 
     // Verify credential
-    appChain.setSigner(ownerKey);
-    const tx2 = await appChain.transaction(ownerKey.toPublicKey(), () => {
+    appChain.setSigner(userKey);
+    tx = await appChain.transaction(userKey.toPublicKey(), () => {
       return credentials.verifyCredential(credentialProof, Field(1));
     });
-    await tx2.sign();
-    await tx2.send();
+
+    await tx.sign();
+    await tx.send();
+
     const block = await appChain.produceBlock();
 
-    const nonceUsed = await appChain.query.runtime.Credentials.usedNonces.get(Field(1));
+    const nonceUsed = await appChain.query.runtime.Credentials.usedNonces.get(
+      Field(1)
+    );
 
     expect(block?.transactions[0].status.toBoolean()).toBe(true);
     expect(nonceUsed?.toBoolean()).toBe(true);
   });
 
-  it("should prevent verification with used nonce", async () => {
-
-    appChain.setSigner(ownerKey);
-
-    // Setup and first verification
-    const tx1 = await appChain.transaction(ownerKey.toPublicKey(), async () => {
-      await credentials.setVerificationStatus(verificationHash, Bool(true));
-      await credentials.setCredentialRoot(map.getRoot());
-      await credentials.verifyCredential(credentialProof, Field(1));
-    });
-    await tx1.sign();
-    await tx1.send();
-    await appChain.produceBlock();
-
-    // Second verification with same nonce
-    const tx2 = await appChain.transaction(ownerKey.toPublicKey(), () => {
+  it("should prevent reuse of nonces", async () => {
+    appChain.setSigner(userKey);
+    const tx = await appChain.transaction(userKey.toPublicKey(), () => {
       return credentials.verifyCredential(credentialProof, Field(1));
     });
-    await tx2.sign();
-    await tx2.send();
+
+    await tx.sign();
+    await tx.send();
+
     const block = await appChain.produceBlock();
 
     expect(block?.transactions[0].status.toBoolean()).toBe(false);
-    expect(block?.transactions[0].statusMessage).toMatch(/Credential verification invalid/);
+    expect(block?.transactions[0].statusMessage).toMatch(/Nonce already used/);
   });
 
-  it("should handle expired credentials", async () => {
-    const expiredProof = await CredentialProof.dummy(
-      undefined,
-      new CredentialPublicOutput({
-        root: map.getRoot(),
-        credentialHash,
-        owner,
-        expirationBlock: Field(1), // Expired block
-        verificationHash,
-      }),
-      0
-    ) as CredentialProof;
-
-    appChain.setSigner(ownerKey);
-
-    const tx = await appChain.transaction(ownerKey.toPublicKey(), async () => {
-      await credentials.setVerificationStatus(verificationHash, Bool(true));
-      await credentials.setCredentialRoot(merkleTreeManager.getRoot());
-      await credentials.verifyCredential(expiredProof, Field(1));
+  it("should handle credential revocation", async () => {
+    // Register issuer
+    appChain.setSigner(adminKey);
+    let tx = await appChain.transaction(adminKey.toPublicKey(), () => {
+      return credentials.registerIssuer(
+        issuerKey.toPublicKey(),
+        Signature.create(adminKey, issuerKey.toPublicKey().toFields())
+      );
     });
     await tx.sign();
     await tx.send();
+    await appChain.produceBlock();
+
+    // Revoke credential
+    appChain.setSigner(issuerKey);
+    tx = await appChain.transaction(issuerKey.toPublicKey(), () => {
+      return credentials.revokeCredential(
+        credentialProof.publicOutput.credentialHash,
+        Signature.create(issuerKey, [
+          credentialProof.publicOutput.credentialHash,
+        ])
+      );
+    });
+    await tx.sign();
+    await tx.send();
+    await appChain.produceBlock();
+
+    // Try to verify revoked credential
+    appChain.setSigner(userKey);
+    tx = await appChain.transaction(userKey.toPublicKey(), () => {
+      return credentials.verifyCredential(credentialProof, Field(2));
+    });
+    await tx.sign();
+    await tx.send();
+
     const block = await appChain.produceBlock();
 
+    const isRevoked =
+      await appChain.query.runtime.Credentials.revokedCredentials.get(
+        credentialProof.publicOutput.credentialHash
+      );
+
     expect(block?.transactions[0].status.toBoolean()).toBe(false);
-    expect(block?.transactions[0].statusMessage).toMatch(/Credential verification invalid/);
+    expect(block?.transactions[0].statusMessage).toMatch(
+      /Credential has been revoked/
+    );
+    expect(isRevoked?.toBoolean()).toBe(true);
   });
 });

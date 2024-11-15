@@ -1,25 +1,24 @@
 // src/runtime/modules/proofGenerator.ts
-import { credentials, CredentialProof } from './credentials';
-import { merkleTreeManager } from './merkleTreeManager';
-import { Field, PublicKey } from 'o1js';
+import { credentials, CredentialProof } from "./credentials";
+import { merkleTreeManager } from "./merkleTreeManager";
+import { Field, PublicKey } from "o1js";
 
 export class ProofGenerationError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'ProofGenerationError';
+    this.name = "ProofGenerationError";
   }
 }
 
 export async function generateCredentialProof(
   id: string,
   credentialHash: Field,
-  owner: PublicKey,
-  expirationBlock: Field,
-  verificationHash: Field
+  issuer: PublicKey,
+  expirationBlock: Field
 ): Promise<CredentialProof> {
   try {
     if (!merkleTreeManager.hasCredential(id)) {
-      throw new ProofGenerationError('Credential not found in Merkle tree');
+      throw new ProofGenerationError("Credential not found in Merkle tree");
     }
 
     const witness = merkleTreeManager.getWitness(id);
@@ -36,9 +35,8 @@ export async function generateCredentialProof(
     const proof = await credentials.verifyCredential(
       witness,
       credentialHash,
-      owner,
-      expirationBlock,
-      verificationHash
+      issuer,
+      expirationBlock
     );
     console.timeEnd("proof");
 
@@ -50,7 +48,7 @@ export async function generateCredentialProof(
       );
     } else {
       throw new ProofGenerationError(
-        'Failed to generate credential proof: Unknown error'
+        "Failed to generate credential proof: Unknown error"
       );
     }
   }

@@ -1,63 +1,63 @@
 // src/runtime/modules/merkleTreeManager.ts
-import { Field, MerkleMap, MerkleMapWitness, Poseidon } from 'o1js';
+import { Field, MerkleMap, MerkleMapWitness, Poseidon } from "o1js";
 
 export class MerkleTreeError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'MerkleTreeError';
+    this.name = "MerkleTreeError";
   }
 }
 
 class MerkleTreeManager {
   private merkleMap: MerkleMap;
   private credentialHashes: Map<string, Field>;
-  private verificationHashes: Map<string, Field>;
   private lastUpdateTimestamp: number;
 
   constructor() {
     this.merkleMap = new MerkleMap();
     this.credentialHashes = new Map();
-    this.verificationHashes = new Map();
     this.lastUpdateTimestamp = Date.now();
   }
 
-  private stringToField(str: string): Field {
-    // Convert string to array of bytes
-    const encoder = new TextEncoder();
-    const bytes = encoder.encode(str);
-    // Convert bytes to Fields
-    const fields = Array.from(bytes).map((byte) => Field(byte));
-    // Hash the fields to get a single Field
-    return Poseidon.hash(fields);
+  private hashId(id: string): Field {
+    const chunks: Field[] = [];
+    for (let i = 0; i < id.length; i++) {
+      chunks.push(Field(id.charCodeAt(i)));
+    }
+    chunks.push(Field(id.length));
+    return Poseidon.hash(chunks);
   }
 
-  public addCredentialHash(
-    id: string,
-    credentialHash: Field,
-    verificationHash: Field
-  ): void {
-    if (
-      !id ||
-      !(credentialHash instanceof Field) ||
-      !(verificationHash instanceof Field)
-    ) {
-      throw new MerkleTreeError('Invalid credential data');
+  private validateInputs(id: string, credentialHash: Field): void {
+    if (!id || id.trim() === "") {
+      throw new MerkleTreeError("Invalid credential ID: ID cannot be empty");
     }
 
-    try {
-      // Convert string ID to Field using the helper method
-      const idField = this.stringToField(id);
-      const key = Poseidon.hash([idField]);
+    if (!credentialHash) {
+      throw new MerkleTreeError("Invalid credential hash: Hash cannot be null");
+    }
 
+    // Convert hash to string and check if it's zero
+    const hashValue = credentialHash.toString();
+    if (hashValue === "0") {
+      throw new MerkleTreeError("Invalid credential hash: Hash cannot be zero");
+    }
+  }
+
+  public addCredentialHash(id: string, credentialHash: Field): void {
+    try {
+      this.validateInputs(id, credentialHash);
+
+      const key = this.hashId(id);
       this.merkleMap.set(key, credentialHash);
       this.credentialHashes.set(id, credentialHash);
-      this.verificationHashes.set(id, verificationHash);
       this.lastUpdateTimestamp = Date.now();
     } catch (error) {
+      if (error instanceof MerkleTreeError) {
+        throw error;
+      }
       throw new MerkleTreeError(
-        `Failed to add credential hash: ${
-          error instanceof Error ? error.message : 'Unknown error'
-        }`
+        `Failed to add credential hash: ${error instanceof Error ? error.message : "Unknown error"}`
       );
     }
   }
@@ -68,11 +68,10 @@ class MerkleTreeManager {
 
   public getWitness(id: string): MerkleMapWitness {
     if (!this.hasCredential(id)) {
-      throw new MerkleTreeError('Credential not found');
+      throw new MerkleTreeError("Credential not found");
     }
-    const idField = this.stringToField(id);
-    const key = Poseidon.hash([idField]);
-    return this.merkleMap.getWitness(key);
+
+    return this.merkleMap.getWitness(this.hashId(id));
   }
 
   public hasCredential(id: string): boolean {
@@ -82,15 +81,7 @@ class MerkleTreeManager {
   public getCredentialHash(id: string): Field {
     const hash = this.credentialHashes.get(id);
     if (!hash) {
-      throw new MerkleTreeError('Credential hash not found');
-    }
-    return hash;
-  }
-
-  public getVerificationHash(id: string): Field {
-    const hash = this.verificationHashes.get(id);
-    if (!hash) {
-      throw new MerkleTreeError('Verification hash not found');
+      throw new MerkleTreeError("Credential hash not found");
     }
     return hash;
   }
@@ -102,7 +93,6 @@ class MerkleTreeManager {
   public reset(): void {
     this.merkleMap = new MerkleMap();
     this.credentialHashes.clear();
-    this.verificationHashes.clear();
     this.lastUpdateTimestamp = Date.now();
   }
 }

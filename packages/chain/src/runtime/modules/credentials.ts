@@ -8,87 +8,103 @@ import {
 import { State, StateMap, assert } from "@proto-kit/protocol";
 import {
   Bool,
+  ZkProgram,
   Field,
   MerkleMapWitness,
   Poseidon,
-  ZkProgram,
   Struct,
   PublicKey,
+  Signature,
 } from "o1js";
+import { inject } from "tsyringe";
+import { Balances } from "./balances";
 
+// First define the public output structure
 export class CredentialPublicOutput extends Struct({
   root: Field,
   credentialHash: Field,
-  owner: PublicKey,
+  issuer: PublicKey,
   expirationBlock: Field,
-  verificationHash: Field, // Added to link with backend verification
 }) {}
 
+// Define the verification function separately
+export async function verifyCredential(
+  witness: MerkleMapWitness,
+  credentialHash: Field,
+  issuer: PublicKey,
+  expirationBlock: Field
+): Promise<CredentialPublicOutput> {
+  const key = Poseidon.hash([credentialHash]);
+  const [computedRoot, computedKey] = witness.computeRootAndKeyV2(
+    Bool(true).toField()
+  );
+  computedKey.assertEquals(key);
+
+  return new CredentialPublicOutput({
+    root: computedRoot,
+    credentialHash,
+    issuer,
+    expirationBlock,
+  });
+}
+
+// Define the ZK program
 export const credentials = ZkProgram({
   name: "credentials",
   publicOutput: CredentialPublicOutput,
 
   methods: {
     verifyCredential: {
-      privateInputs: [
-        MerkleMapWitness,
-        Field,
-        PublicKey,
-        Field,
-        Field, // verificationHash
-      ],
-
-      method(
-        witness: MerkleMapWitness,
-        credentialHash: Field,
-        owner: PublicKey,
-        expirationBlock: Field,
-        verificationHash: Field
-      ): Promise<CredentialPublicOutput> {
-        const key = Poseidon.hash([credentialHash]);
-        const [computedRoot, computedKey] = witness.computeRootAndKeyV2(
-          Bool(true).toField()
-        );
-        computedKey.assertEquals(key);
-
-        return Promise.resolve(
-          new CredentialPublicOutput({
-            root: computedRoot,
-            credentialHash,
-            owner,
-            expirationBlock,
-            verificationHash,
-          })
-        );
-      },
+      privateInputs: [MerkleMapWitness, Field, PublicKey, Field],
+      method: verifyCredential,
     },
   },
 });
 
 export class CredentialProof extends ZkProgram.Proof(credentials) {}
 
-@runtimeModule()
-export class Credentials extends RuntimeModule<{}> {
-  @state() public credentialRoot = State.from<Field>(Field);
-  @state() public usedNonces = StateMap.from<Field, Bool>(Field, Bool);
-  @state() public verificationStatus = StateMap.from<Field, Bool>(Field, Bool);
+type CredentialsConfig = Record<string, never>;
 
-  constructor() {
+@runtimeModule()
+export class Credentials extends RuntimeModule<CredentialsConfig> {
+  @state() public credentialRoot = State.from<Field>(Field);
+  @state() public issuers = StateMap.from<PublicKey, Bool>(PublicKey, Bool);
+  @state() public usedNonces = StateMap.from<Field, Bool>(Field, Bool);
+  @state() public revokedCredentials = StateMap.from<Field, Bool>(Field, Bool);
+
+  public constructor(@inject("Balances") public balances: Balances) {
     super();
   }
 
   @runtimeMethod()
-  public async createCredential(
-    credentialHash: Field,
-    expirationBlock: Field,
-    verificationHash: Field
-  ) {
-    // Verify the verification hash exists and is valid
-    const isVerified = await this.verificationStatus.get(verificationHash);
-    assert(isVerified?.value.equals(Bool(true)), "Credential not verified by backend");
+  public async setCredentialRoot(root: Field, issuerSignature: Signature) {
+    const isIssuer = await this.issuers.get(this.transaction.sender.value);
+    assert(
+      isIssuer.value,
+      "Only registered issuers can set the credential root"
+    );
 
-    // Update credential root
-    await this.credentialRoot.set(credentialHash);
+    const isValidSignature = issuerSignature.verify(
+      this.transaction.sender.value,
+      [root]
+    );
+    assert(isValidSignature, "Invalid issuer signature");
+
+    await this.credentialRoot.set(root);
+  }
+
+  @runtimeMethod()
+  public async registerIssuer(issuer: PublicKey, adminSignature: Signature) {
+    // Using environment variable for admin public key
+    const adminPublicKey = PublicKey.fromBase58(process.env.ADMIN_PUBLIC_KEY!);
+
+    const isValidSignature = adminSignature.verify(
+      adminPublicKey,
+      issuer.toFields()
+    );
+    assert(isValidSignature, "Invalid admin signature");
+
+    await this.issuers.set(issuer, Bool(true));
   }
 
   @runtimeMethod()
@@ -96,28 +112,28 @@ export class Credentials extends RuntimeModule<{}> {
     // Verify the proof
     proof.verify();
 
-    // Check credential root
+    // Check current root matches
     const currentRoot = await this.credentialRoot.get();
     assert(
       proof.publicOutput.root.equals(currentRoot.value),
       "Invalid credential root"
     );
 
-    // Check verification status
-    const isVerified = await this.verificationStatus.get(
-      proof.publicOutput.verificationHash
-    );
-    assert(isVerified?.value, "Credential verification invalid");
-
     // Check nonce hasn't been used
     const isNonceUsed = await this.usedNonces.get(nonce);
     assert(isNonceUsed.value.not(), "Nonce already used");
 
+    // Check credential isn't revoked
+    const isRevoked = await this.revokedCredentials.get(
+      proof.publicOutput.credentialHash
+    );
+    assert(isRevoked.value.not(), "Credential has been revoked");
+
     // Check expiration
     const currentBlockHeight = this.network.block.height.toFields()[0];
     assert(
-      proof.publicOutput.expirationBlock.greaterThan(Field(currentBlockHeight)),
-      "Credential expired"
+      proof.publicOutput.expirationBlock.greaterThan(currentBlockHeight),
+      "Credential has expired"
     );
 
     // Mark nonce as used
@@ -125,15 +141,19 @@ export class Credentials extends RuntimeModule<{}> {
   }
 
   @runtimeMethod()
-  public async setVerificationStatus(
-    verificationHash: Field,
-    status: Bool
+  public async revokeCredential(
+    credentialHash: Field,
+    issuerSignature: Signature
   ) {
-    await this.verificationStatus.set(verificationHash, status);
-  }
+    const isIssuer = await this.issuers.get(this.transaction.sender.value);
+    assert(isIssuer.value, "Only registered issuers can revoke credentials");
 
-  @runtimeMethod()
-  public async setCredentialRoot(root: Field) {
-    await this.credentialRoot.set(root);
+    const isValidSignature = issuerSignature.verify(
+      this.transaction.sender.value,
+      [credentialHash]
+    );
+    assert(isValidSignature, "Invalid issuer signature");
+
+    await this.revokedCredentials.set(credentialHash, Bool(true));
   }
 }

@@ -1,11 +1,11 @@
 // src/runtime/modules/offChainCredentials.ts
-import { Field, Poseidon } from 'o1js';
-import { CredentialType } from './types';
+import { Field, Poseidon } from "o1js";
+import { CredentialType } from "./types";
 
 export class ValidationError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'ValidationError';
+    this.name = "ValidationError";
   }
 }
 
@@ -17,44 +17,41 @@ export interface Credential {
     credentialType: CredentialType;
     version: number;
   };
-  verification?: {
-    verificationHash: Field;
-    verifiedAt: number;
-    verifierData?: Record<string, any>;
-  };
 }
 
 function stringToFields(str: string): Field[] {
+  // Convert string to array of character codes and then to Fields
   return Array.from(str).map((char) => Field(char.charCodeAt(0)));
 }
 
 function convertToField(value: any): Field {
-  if (typeof value === 'string') {
+  if (typeof value === "string") {
+    // Hash the array of character code Fields
     const charFields = stringToFields(value);
     return Poseidon.hash(charFields);
   }
-  if (typeof value === 'number') {
+  if (typeof value === "number") {
     return Field(value);
   }
-  if (typeof value === 'boolean') {
+  if (typeof value === "boolean") {
     return Field(value ? 1 : 0);
   }
   if (value instanceof Field) {
     return value;
   }
-  throw new ValidationError('Unsupported attribute type');
+  throw new ValidationError("Unsupported attribute type");
 }
 
 export function validateCredential(credential: Credential): void {
-  if (!credential.id || typeof credential.id !== 'string') {
-    throw new ValidationError('Invalid credential ID');
+  if (!credential.id || typeof credential.id !== "string") {
+    throw new ValidationError("Invalid credential ID");
   }
 
-  if (!credential.attributes || typeof credential.attributes !== 'object') {
-    throw new ValidationError('Invalid credential attributes');
+  if (!credential.attributes || typeof credential.attributes !== "object") {
+    throw new ValidationError("Invalid credential attributes");
   }
 
-  // Validate attributes
+  // Validate each attribute can be converted to Field
   for (const [key, value] of Object.entries(credential.attributes)) {
     try {
       convertToField(value);
@@ -65,36 +62,22 @@ export function validateCredential(credential: Credential): void {
       );
     }
   }
-
-  // Validate verification data if present
-  if (credential.verification) {
-    if (!(credential.verification.verificationHash instanceof Field)) {
-      throw new ValidationError('Invalid verification hash');
-    }
-    if (
-      typeof credential.verification.verifiedAt !== 'number' ||
-      isNaN(credential.verification.verifiedAt)
-    ) {
-      throw new ValidationError('Invalid verification timestamp');
-    }
-  }
 }
 
 export function hashCredential(credential: Credential): Field {
   validateCredential(credential);
 
-  // Hash ID
+  // Convert ID string to Fields and hash
   const idFields = stringToFields(credential.id);
   const idHash = Poseidon.hash(idFields);
 
-  // Hash attributes
+  // Convert and hash attributes
   const attributeFields = Object.entries(credential.attributes).map(
     ([_, value]) => convertToField(value)
   );
 
   const fields = [idHash, ...attributeFields];
 
-  // Add metadata if present
   if (credential.metadata) {
     fields.push(
       Field(credential.metadata.expirationBlock),
@@ -103,27 +86,5 @@ export function hashCredential(credential: Credential): Field {
     );
   }
 
-  // Add verification data if present
-  if (credential.verification) {
-    fields.push(
-      credential.verification.verificationHash,
-      Field(credential.verification.verifiedAt)
-    );
-  }
-
   return Poseidon.hash(fields);
-}
-
-export function createVerificationHash(
-  credentialId: string,
-  verifierData: Record<string, any>
-): Field {
-  const idFields = stringToFields(credentialId);
-  const dataFields = Object.entries(verifierData).map(([key, value]) => {
-    const keyFields = stringToFields(key);
-    const valueField = convertToField(value);
-    return Poseidon.hash([...keyFields, valueField]);
-  });
-
-  return Poseidon.hash([...idFields, ...dataFields]);
 }
